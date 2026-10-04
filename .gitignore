@@ -18,3 +18,5 @@ callchain_filtered.txt
 DEVELOPMENT_NOTES.md
 docs/
 tools/
+
+src/main/native/*.obj

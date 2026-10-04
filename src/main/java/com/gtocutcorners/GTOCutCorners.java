@@ -55,6 +55,7 @@ public class GTOCutCorners {
     public GTOCutCorners() {
         config = GTOConfig.load();
         jlog("Config: oneTick=" + config.oneTickMode
+            + " speedDivisor=" + config.speedDivisor
             + " vanilla=" + config.patchVanilla + " gt=" + config.patchGT + " massPatch=" + config.patchGTMass);
         IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
         GTOBlocks.BLOCKS.register(modBus);
@@ -147,7 +148,11 @@ public class GTOCutCorners {
 
     private static native Collection<GTRecipeDefinition> getRecipeCollection();
     private static native int nativeSetIntField(Object obj, String fieldName, int newValue);
-    private static native int nativeMassPatch();
+    /**
+     * Batch-patch GT recipe durations. divisor semantics: 0 = force 1 tick
+     * (oneTickMode sentinel), N >= 1 = duration = max(1, original / N).
+     */
+    private static native int nativeMassPatch(int divisor);
     private static native void nativeInitJVMTI();
 
     // ======================== cookingTime field discovery ========================
@@ -223,31 +228,61 @@ public class GTOCutCorners {
 
     // ======================== GT recipe patch ========================
 
-    private static final Set<String> GENS = Set.of(
-        "combustion","gas_turbine","steam_boiler","large_boiler",
-        "rock_breaker","heat_exchanger","steam_turbine","plasma_generator"
+    /**
+     * Exact recipe-type names excluded from duration patching, kept verbatim in
+     * sync with genTypes[] in src/main/native/patcher.c (isExcludedType).
+     * Matched with equals() against the path segment after ':' in
+     * recipeType.toString() ("namespace:path", no trailing slash on types).
+     * rock_breaker and heat_exchanger are deliberate balance exemptions,
+     * not generators.
+     */
+    private static final Set<String> EXCLUDED_TYPES = Set.of(
+        "combustion_generator", "gas_turbine", "steam_turbine",
+        "plasma_generator", "thermal_generator", "semi_fluid_generator",
+        "supercritical_steam_turbine", "rocket_engine", "large_boiler",
+        "steam_boiler",
+        "naquadah_reactor", "hyper_reactor", "advanced_hyper_reactor",
+        "large_naquadah_reactor", "mana_garden", "annihilate_generator",
+        "fuel_cell_energy_absorption",
+        "fuel_cell_energy_transfer", "fuel_cell_energy_release",
+        "space_elevator",
+        "scanner", "world_data_scanner", "radiation_hatch", "space_probe_surface_reception",
+        "rock_breaker", "heat_exchanger"
     );
 
-    /** Recipe types that must keep their original duration (progression / logic-critical). */
-    private static final Set<String> KEEP_DURATION = Set.of(
-        "scanner", "world_data_scanner", "radiation_hatch", "space_probe_surface_reception"
-    );
+    /** Identity-keyed original durations, so a repaired retry path can never divide twice. */
+    private static final Map<GTRecipeDefinition, Integer> durationSnapshot = new IdentityHashMap<>();
+
+    /** oneTickMode=true -> 1; otherwise max(1, orig/divisor) with identity-keyed snapshot. */
+    private static int targetDuration(GTRecipeDefinition r) {
+        if (config.oneTickMode) return 1;
+        int orig = durationSnapshot.computeIfAbsent(r, k -> k.duration);
+        return Math.max(1, orig / Math.max(1, config.speedDivisor));
+    }
+
+    private static boolean isExcluded(GTRecipeDefinition r) {
+        if (r.recipeType == null) return false;
+        String tn = r.recipeType.toString(); // "namespace:path"
+        int colon = tn.indexOf(':');
+        String path = colon >= 0 ? tn.substring(colon + 1) : tn;
+        int slash = path.indexOf('/');
+        if (slash >= 0) path = path.substring(0, slash);
+        return EXCLUDED_TYPES.contains(path);
+    }
 
     private static int patchGT(Collection<GTRecipeDefinition> recipes) {
         int count = 0, skipped = 0, errors = 0, total = 0;
         for (GTRecipeDefinition r : recipes) {
             total++;
             try {
-                if (r.recipeType != null) {
-                    String tn = r.recipeType.toString().toLowerCase();
-                    boolean isGen = false;
-                    for (String kw : GENS) { if (tn.contains(kw)) { isGen = true; break; } }
-                    boolean keep = false;
-                    for (String kw : KEEP_DURATION) { if (tn.contains(kw)) { keep = true; break; } }
-                    if (isGen || keep) { skipped++; continue; }
+                if (isExcluded(r)) { skipped++; continue; }
+                int target = targetDuration(r);
+                if (r.duration != target) {
+                    nativeSetIntField(r, "duration", target);
+                    count++;
+                } else {
+                    skipped++;
                 }
-                nativeSetIntField(r, "duration", 1);
-                count++;
             } catch (Exception e) { errors++; }
         }
         jlog("patchGT: " + count + " patched " + skipped + " skipped " + errors + " errors");
@@ -269,7 +304,14 @@ public class GTOCutCorners {
             if (total == 0) return 0;
             for (Object r : all) {
                 if (r instanceof AbstractCookingRecipe acr) {
-                    try { if (setCookingTime(acr, 1)) count++; else errs++; } catch (Exception e) { errs++; }
+                    int target;
+                    if (config.oneTickMode) {
+                        target = 1;
+                    } else {
+                        int orig = acr.getCookingTime();
+                        target = Math.max(1, orig / Math.max(1, config.speedDivisor));
+                    }
+                    try { if (setCookingTime(acr, target)) count++; else errs++; } catch (Exception e) { errs++; }
                 }
             }
             jlog("patchVanilla: total=" + total + " patched=" + count + " errors=" + errs);
@@ -303,18 +345,21 @@ public class GTOCutCorners {
                 jlog("JVMTI retransform already done, skipping");
             }
 
+            // divisor: 0 = oneTickMode sentinel (force 1 tick), else the configured factor
+            int divisor = config.oneTickMode ? 0 : Math.max(1, config.speedDivisor);
+
             // vanilla patch
             int va = 0;
-            if (config.patchVanilla && config.oneTickMode) va = patchVanilla(level);
+            if (config.patchVanilla) va = patchVanilla(level);
 
             // GT patch
             int massResult = 0;
             if (config.patchGT) {
                 Collection<GTRecipeDefinition> recipes = getRecipeCollection();
                 jlog("Got " + recipes.size() + " GT recipes");
-                if (config.oneTickMode && config.patchGTMass) {
-                    massResult = nativeMassPatch();
-                    jlog("nativeMassPatch: " + massResult);
+                if (config.patchGTMass) {
+                    massResult = nativeMassPatch(divisor);
+                    jlog("nativeMassPatch(divisor=" + divisor + "): " + massResult);
                     if (massResult < 0) {
                         int fallback = patchGT(recipes);
                         jlog("native mass patch failed; Java fallback patched " + fallback);

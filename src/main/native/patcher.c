@@ -325,8 +325,81 @@ static jobject fallbackCollectRecipes(JNIEnv *e) {
 }
 
 /*
- * Check if a recipe type name should be excluded from 1-tick patching.
- * Generator fuels and space elevator recipes must keep original durations.
+ * Identity-keyed snapshot of original durations, so a repaired retry path
+ * can never divide a value twice. Key = raw jobject pointer (stable while
+ * the matching JNI global reference is held, which also blocks address
+ * reuse by the GC). Open addressing + linear probing, 70% load factor.
+ */
+typedef struct SnapEntry { jobject ref; jint orig; } SnapEntry;
+static SnapEntry* snapTable = NULL;
+static size_t snapCap = 0, snapUsed = 0;
+
+static size_t snapHash(jobject o) {
+    return (size_t)(((uintptr_t)o) * 2654435761u);
+}
+
+static void snapInsert(JNIEnv *e, jobject d, jint orig);
+
+static void snapGrow(JNIEnv *e) {
+    size_t newCap = snapCap ? snapCap * 2 : 65536;
+    SnapEntry* old = snapTable;
+    size_t oldCap = snapCap;
+    snapTable = (SnapEntry*)calloc(newCap, sizeof(SnapEntry));
+    if (!snapTable) { snapTable = old; snapCap = oldCap; return; } /* keep old table on OOM */
+    snapCap = newCap;
+    snapUsed = 0;
+    for (size_t i = 0; i < oldCap; i++) {
+        if (old[i].ref) snapInsert(e, old[i].ref, old[i].orig); /* refs already global */
+    }
+    free(old);
+}
+
+static void snapInsert(JNIEnv *e, jobject d, jint orig) {
+    if (!d) return;
+    if (snapCap == 0 || snapUsed * 10 >= snapCap * 7) snapGrow(e);
+    if (!snapTable) return;
+    size_t idx = snapHash(d) & (snapCap - 1);
+    while (snapTable[idx].ref) {
+        if (snapTable[idx].ref == d) { snapTable[idx].orig = orig; return; }
+        idx = (idx + 1) & (snapCap - 1);
+    }
+    jobject g = (*e)->NewGlobalRef(e, d);
+    if (!g) { (*e)->ExceptionClear(e); return; }
+    snapTable[idx].ref = g;
+    snapTable[idx].orig = orig;
+    snapUsed++;
+}
+
+static int snapLookup(JNIEnv *e, jobject d, jint* outOrig) {
+    if (!snapTable || !d) return 0;
+    size_t idx = snapHash(d) & (snapCap - 1);
+    while (snapTable[idx].ref) {
+        if (snapTable[idx].ref == d) { *outOrig = snapTable[idx].orig; return 1; }
+        idx = (idx + 1) & (snapCap - 1);
+    }
+    return 0;
+}
+
+/*
+ * Compute the patch target: divisor <= 0 means "force 1 tick" (oneTickMode
+ * sentinel); otherwise max(1, orig / divisor). orig comes from the identity
+ * snapshot, never from the (possibly already-patched) live field.
+ */
+static jint computeTarget(JNIEnv *e, jobject d, jint live, jint divisor) {
+    jint orig;
+    if (!snapLookup(e, d, &orig)) {
+        orig = live;
+        snapInsert(e, d, orig);
+    }
+    if (divisor <= 0) return 1;
+    if (orig <= divisor) return 1;
+    return orig / divisor;
+}
+
+/*
+ * Check if a recipe type name should be excluded from duration patching.
+ * Generator fuels and progression-critical types must keep original durations.
+ * rock_breaker and heat_exchanger are deliberate balance exemptions, not generators.
  */
 static int isExcludedType(const char* rid) {
     if (!rid) return 0;
@@ -372,6 +445,8 @@ static int isExcludedType(const char* rid) {
         "fuel_cell_energy_transfer", "fuel_cell_energy_release",
         "space_elevator",
         "scanner", "world_data_scanner", "radiation_hatch", "space_probe_surface_reception",
+        /* deliberate balance exemptions (positive EUt, so EUt auto-detect will not catch them) */
+        "rock_breaker", "heat_exchanger",
         NULL
     };
     for (int i = 0; genTypes[i] != NULL; i++) {
@@ -536,9 +611,14 @@ JNIEXPORT jint JNICALL Java_com_gtocutcorners_GTOCutCorners_nativeSetIntField
 }
 
 JNIEXPORT jint JNICALL Java_com_gtocutcorners_GTOCutCorners_nativeMassPatch
-    (JNIEnv *e, jclass cls) {
+    (JNIEnv *e, jclass cls, jint divisor) {
     lf = fopen("gtocutcorners_native.log", "w");
-    L("[NATIVE] Mass patch via GTRegistries...");
+    {
+        char ib[128];
+        snprintf(ib, sizeof(ib), "[NATIVE] Mass patch via GTRegistries... divisor=%d%s",
+            divisor, divisor <= 0 ? " (force 1 tick)" : "");
+        L(ib);
+    }
     jobject coll = collectAllRecipes(e);
     if (coll != NULL) {
         jclass colC = (*e)->GetObjectClass(e, coll);
@@ -671,7 +751,8 @@ JNIEXPORT jint JNICALL Java_com_gtocutcorners_GTOCutCorners_nativeMassPatch
         }
         if (durF) {
             jint dd = (*e)->GetIntField(e, d, durF);
-            if (dd != 1) { (*e)->SetIntField(e, d, durF, 1); dC++; }
+            jint target = computeTarget(e, d, dd, divisor);
+            if (dd != target) { (*e)->SetIntField(e, d, durF, target); dC++; }
         }
         if (i % 20000 == 0) {
             snprintf(buf, sizeof(buf), "[NATIVE] %d/%d d=%d", i, len, dC);
@@ -679,7 +760,8 @@ JNIEXPORT jint JNICALL Java_com_gtocutcorners_GTOCutCorners_nativeMassPatch
         }
     }
     (*e)->PopLocalFrame(e, NULL);
-    snprintf(buf, sizeof(buf), "[NATIVE] DONE: %d d=%d skip=%d", len, dC, genSkip);
+    snprintf(buf, sizeof(buf), "[NATIVE] DONE: %d d=%d skip=%d divisor=%d snapshot=%d",
+        len, dC, genSkip, divisor, (int)snapUsed);
     L(buf);
     fclose(lf);
     return dC;

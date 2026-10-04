@@ -10,7 +10,15 @@ public class GTOConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_PATH = Paths.get("config", "gtocutcorners.json");
 
-    public boolean oneTickMode = true;
+    /** Legacy switch: true forces every non-excluded recipe to exactly 1 tick (ignores speedDivisor). */
+    public boolean oneTickMode = false;
+
+    /**
+     * Divide non-excluded recipe durations by this factor: duration = max(1, original / speedDivisor).
+     * Only used when oneTickMode is false. Values below 1 are clamped back to 1 on load.
+     */
+    public int speedDivisor = 4;
+
     public boolean patchVanilla = true;
     public boolean patchGT = true;
     public boolean patchGTMass = true;
@@ -52,6 +60,7 @@ public class GTOConfig {
         } catch (Exception e) {
             System.err.println("[GTOConfig] load failed: " + e.getMessage());
         }
+        if (cfg.speedDivisor < 1) cfg.speedDivisor = 1;
         return cfg;
     }
 }
