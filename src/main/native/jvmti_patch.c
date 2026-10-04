@@ -1,11 +1,14 @@
 /*
  * jvmti_patch.c - JVMTI patches
  *
- * 1. Drill classes: bipush 20 (MAX_PROGRESS) -> bipush 1
- * 2. ICustomRecipeLogicHolder machines: duration(N) -> duration(1)
- *    (sipush 400/600/6000, bipush 20 in createCustomRecipe -> sipush/bipush 1)
+ * 1. Drill classes: bipush 20 (MAX_PROGRESS) -> bipush 5
+ * 2. ICustomRecipeLogicHolder machines: duration(N) -> duration(N/4)
+ *    (bipush 20->5, sipush 400->100, sipush 600->150, sipush 6000->1500;
+ *     all same instruction width, so branch offsets and StackMapTable stay valid)
  * 3. RecipeLogic.setupRecipe injection: REMOVED (harmed standard machines)
- * 4. Diag dump
+ * 4. RecipeModifier overclocking patch: REMOVED -- GTCEu native overclocking
+ *    is restored and now stacks on top of the data-layer /4 divisor.
+ * 5. Diag dump
  */
 
 #include <jvmti.h>
@@ -125,19 +128,19 @@ static void JNICALL jvmti_class_file_load_hook(
 
     /* 0c. TransformationServiceDecorator retransform — simpler target */
 
-    /* 1. Drill classes: bipush 20 -> bipush 1 */
+    /* 1. Drill classes: bipush 20 -> bipush 5 */
     const char* drills[]={"com/gtocore/common/machine/trait/INFFluidDrillLogic",
                           "com/gtocore/common/machine/trait/AdvancedInfiniteDrillLogic",
                           "com/gregtechceu/gtceu/common/machine/trait/FluidDrillLogic",NULL};
     for(const char**d=drills;*d;d++)if(strcmp(name,*d)==0){
-        jvmti_log("=== %s: bipush 20->1 ===",*d);
+        jvmti_log("=== %s: bipush 20->5 ===",*d);
         int rp=0;ju1*mod=(ju1*)malloc(dlen);memcpy(mod,data,dlen);
-        for(int i=0;i<dlen-1;i++)if(mod[i]==0x10&&mod[i+1]==0x14){mod[i+1]=0x01;rp++;}
+        for(int i=0;i<dlen-1;i++)if(mod[i]==0x10&&mod[i+1]==0x14){mod[i+1]=0x05;rp++;}
         if(rp>0){ju1*jb;jvmtiError e=(*jt_env)->Allocate(jt_env,dlen,&jb);if(e==JVMTI_ERROR_NONE){memcpy(jb,mod,dlen);*ndlen=dlen;*ndata=jb;}}
         free(mod);return;
     }
 
-    /* 1b. ICustomRecipeLogicHolder machines: patch createCustomRecipe duration constants -> 1 */
+    /* 1b. ICustomRecipeLogicHolder machines: patch createCustomRecipe duration constants -> N/4 */
     {
         const char* dur20[]={
             "com/gtocore/common/machine/multiblock/electric/ChiselMachine",
@@ -160,29 +163,29 @@ static void JNICALL jvmti_class_file_load_hook(
         ju1*mod=(ju1*)malloc(dlen);
         memcpy(mod,data,dlen);
 
-        /* bipush 20 -> bipush 1 (same as drills) */
+        /* bipush 20 -> bipush 5 (same as drills) */
         for(const char**t=dur20;*t;t++)if(strcmp(name,*t)==0){matched=1;break;}
         if(matched){
-            jvmti_log("=== %s: bipush 20->1 ===",name);
-            for(int i=0;i<dlen-1;i++)if(mod[i]==0x10&&mod[i+1]==0x14){mod[i+1]=0x01;rp++;}
+            jvmti_log("=== %s: bipush 20->5 ===",name);
+            for(int i=0;i<dlen-1;i++)if(mod[i]==0x10&&mod[i+1]==0x14){mod[i+1]=0x05;rp++;}
         }
-        /* sipush 400 -> sipush 1 */
+        /* sipush 400 -> sipush 100 */
         if(!matched){for(const char**t=dur400;*t;t++)if(strcmp(name,*t)==0){matched=2;break;}}
         if(matched==2){
-            jvmti_log("=== %s: sipush 400->1 ===",name);
-            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x01&&mod[i+2]==0x90){mod[i+1]=0x00;mod[i+2]=0x01;rp++;}
+            jvmti_log("=== %s: sipush 400->100 ===",name);
+            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x01&&mod[i+2]==0x90){mod[i+1]=0x00;mod[i+2]=0x64;rp++;}
         }
-        /* sipush 600 -> sipush 1 */
+        /* sipush 600 -> sipush 150 */
         if(!matched){for(const char**t=dur600;*t;t++)if(strcmp(name,*t)==0){matched=3;break;}}
         if(matched==3){
-            jvmti_log("=== %s: sipush 600->1 ===",name);
-            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x02&&mod[i+2]==0x58){mod[i+1]=0x00;mod[i+2]=0x01;rp++;}
+            jvmti_log("=== %s: sipush 600->150 ===",name);
+            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x02&&mod[i+2]==0x58){mod[i+1]=0x00;mod[i+2]=0x96;rp++;}
         }
-        /* sipush 6000 -> sipush 1 */
+        /* sipush 6000 -> sipush 1500 */
         if(!matched){for(const char**t=dur6000;*t;t++)if(strcmp(name,*t)==0){matched=4;break;}}
         if(matched==4){
-            jvmti_log("=== %s: sipush 6000->1 ===",name);
-            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x17&&mod[i+2]==0x70){mod[i+1]=0x00;mod[i+2]=0x01;rp++;}
+            jvmti_log("=== %s: sipush 6000->1500 ===",name);
+            for(int i=0;i<dlen-2;i++)if(mod[i]==0x11&&mod[i+1]==0x17&&mod[i+2]==0x70){mod[i+1]=0x05;mod[i+2]=0xDC;rp++;}
         }
 
         if(matched&&rp>0){
@@ -193,103 +196,12 @@ static void JNICALL jvmti_class_file_load_hook(
         if(matched)return;
     }
 
-    /* 1c. RecipeModifier OVERCLOCKING: change speed=1.0 to speed=0.0
-     *   In the 3-arg overclocking method (public API entry):
-     *     dconst_1 (speed=1.0) at code[5] -> dconst_0 (speed=0.0)
-     *   This makes duration = recipe.duration * 0.0 = 0 in the inner
-     *   10-arg method, triggering the else-branch -> recipe.duration = 1.
-     *   Single-byte change. No StackMapTable/attribute fixes needed.
+    /* 1c. RecipeModifier OVERCLOCKING patch: REMOVED.
+     * The old speed=1.0 -> 0.0 dconst patch forced recipe.duration = 1,
+     * destroying GTCEu native overclocking. Data-layer /4 now happens in
+     * patcher.c (nativeMassPatch), and native overclocking stacks on top.
+     * No RecipeModifier bytecode is touched anymore.
      */
-    if(strcmp(name,"com/gregtechceu/gtceu/api/recipe/modifier/RecipeModifier")==0){
-        jvmti_log("=== RecipeModifier: hook fired ===");
-        ju2 cc=rd_u2(data+8);int o=10;
-        jvmti_log("RM: cp_count=%d dlen=%d",(int)cc,dlen);
-        /* walk constant pool */
-        for(ju2 i=1;i<cc;i++){
-            if(o>=dlen){jvmti_log("RM: CP overflow at idx %d",i);goto rm_done;}
-            ju1 t=data[o];
-            switch(t){
-                case 1:{ju2 sl=rd_u2(data+o+1);o+=1+2+sl;break;}
-                case 3:case 4:o+=5;break;
-                case 5:case 6:o+=9;i++;break;
-                case 7:case 8:case 16:case 19:case 20:o+=3;break;
-                case 9:case 10:case 11:case 12:case 17:case 18:o+=5;break;
-                case 15:o+=4;break;
-                default:jvmti_log("RM: bad CP tag %d at idx %d",t,i);goto rm_done;
-            }
-        }
-        /* skip access_flags+this_class+super_class+interfaces */
-        if(o+8>dlen){jvmti_log("RM: class header past end");goto rm_done;}
-        o+=2+2+2; ju2 ic=rd_u2(data+o); o+=2+ic*2;
-        /* skip fields */
-        if(o+2>dlen){jvmti_log("RM: fields header past end");goto rm_done;}
-        ju2 fc=rd_u2(data+o);o+=2;
-        for(ju2 f=0;f<fc;f++){o+=6;ju2 fa=rd_u2(data+o);o+=2;for(ju2 a=0;a<fa;a++){ju4 al=rd_u4(data+o+2);o+=6+al;}}
-        /* methods */
-        if(o+2>dlen){jvmti_log("RM: methods header past end");goto rm_done;}
-        ju2 mc=rd_u2(data+o);o+=2;
-        jvmti_log("RM: scanning %d methods",(int)mc);
-        int rm_found=0;
-        for(ju2 m=0;m<mc&&!rm_found;m++){
-            int ms=o;
-            ju2 ma_flags=rd_u2(data+o);o+=2;
-            ju2 ni=rd_u2(data+o);o+=2;
-            ju2 di=rd_u2(data+o);o+=2;
-            ju2 ac=rd_u2(data+o);o+=2;
-            char mn[256],md[512];
-            cp_utf8(data,dlen,ni,mn,sizeof(mn));
-            cp_utf8(data,dlen,di,md,sizeof(md));
-            if(strcmp(mn,"overclocking")==0){
-                int is_static=(ma_flags&0x0008)!=0;
-                jvmti_log("RM: method[%d] overclocking static=%d desc=%s",(int)m,is_static,md);
-                if(is_static && strstr(md,"IRecipeHandlerHolder") && strstr(md,"RecipeHandlerUnit")
-                    && strstr(md,"GTRecipe") && !strstr(md,"ZDDD")){
-                    jvmti_log("RM: *** TARGET: public 3-arg overclocking found! ***");
-                    int ao=o;
-                    for(ju2 a=0;a<ac;a++){
-                        ju2 ani=rd_u2(data+ao);ju4 al=rd_u4(data+ao+2);
-                        char an[256];cp_utf8(data,dlen,ani,an,sizeof(an));
-                        if(strcmp(an,"Code")==0){
-                            int c_off=ao+6;
-                            ju2 mx_stk=rd_u2(data+c_off);
-                            ju2 mx_loc=rd_u2(data+c_off+2);
-                            ju4 cl=rd_u4(data+c_off+4);
-                            int cs=c_off+8;
-                            jvmti_log("RM: Code len=%d stack=%d locals=%d",(int)cl,(int)mx_stk,(int)mx_loc);
-                            jvmti_log("RM: code[0..12]=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                                data[cs],data[cs+1],data[cs+2],data[cs+3],data[cs+4],data[cs+5],
-                                data[cs+6],data[cs+7],data[cs+8],data[cs+9],data[cs+10],data[cs+11],data[cs+12]);
-                            if(cl>=13){
-                                jvmti_log("RM: code[3]=0x%02X code[4]=0x%02X code[5]=0x%02X code[6]=0x%02X",
-                                    data[cs+3],data[cs+4],data[cs+5],data[cs+6]);
-                                if(data[cs+5]==0x0F){
-                                    jvmti_log("RM: code[5]==0x0F (dconst_1=speed=1.0) -> patching to 0x0E (dconst_0=speed=0.0)");
-                                    ju1*mod=(ju1*)malloc(dlen);memcpy(mod,data,dlen);
-                                    mod[cs+5]=0x0E;
-                                    ju1*jb;jvmtiError err=(*jt_env)->Allocate(jt_env,dlen,&jb);
-                                    if(err==JVMTI_ERROR_NONE){memcpy(jb,mod,dlen);*ndlen=dlen;*ndata=jb;
-                                        jvmti_log("RM: *** PATCH APPLIED speed=1.0->0.0 (duration will be forced to 1) ***");
-                                        rm_found=1;
-                                    }else{jvmti_log("RM: Allocate failed err=%d",(int)err);}
-                                    free(mod);
-                                }else{jvmti_log("RM: code[5]=0x%02X != 0x0F, not dconst_1? skip",data[cs+5]);}
-                            }else{jvmti_log("RM: Code too short: %d < 13",(int)cl);}
-                            break;
-                        }
-                        ao+=6+al;
-                    }
-                }
-            }
-            /* skip method attributes */
-            for(ju2 a=0;a<ac;a++){ju4 al=rd_u4(data+o+2);o+=6+al;}
-        }
-        if(!rm_found)jvmti_log("RM: 3-arg overclocking NOT patched (not found / already modified / wrong layout)");
-        else jvmti_log("RM: patch OK, returning modified bytecode");
-        if(rm_found)return;
-    }
-rm_done:
-    if(strcmp(name,"com/gregtechceu/gtceu/api/recipe/modifier/RecipeModifier")==0)
-        jvmti_log("RM: parse aborted (class format unexpected)");
 
     /* 2. RecipeLogic.setupRecipe injection - REMOVED:
  * This global injection harmed standard machines (boilers, heaters)
@@ -353,15 +265,7 @@ static void redefine_loaded_classes(JNIEnv*env){
         "com/gtocore/common/machine/multiblock/electric/space/SatelliteControlCenterMachine",
     NULL};
     for(const char**t=dur_targets;*t;t++){jclass c=(*env)->FindClass(env,*t);if(c){jvmtiError e=(*g_jvmti)->RetransformClasses(g_jvmti,1,&c);jvmti_log("Duration %s: %s",*t,e==JVMTI_ERROR_NONE?"OK":"FAIL");(*env)->DeleteLocalRef(env,c);}else(*env)->ExceptionClear(env);}
-    /* 1c. RecipeModifier retransform for overclocking patch */
-    {
-        const char* rm="com/gregtechceu/gtceu/api/recipe/modifier/RecipeModifier";
-        jclass c=(*env)->FindClass(env,rm);
-        if(c){jvmtiError e=(*g_jvmti)->RetransformClasses(g_jvmti,1,&c);
-            jvmti_log("RecipeModifier retransform: %s",e==JVMTI_ERROR_NONE?"OK":"FAIL");
-            (*env)->DeleteLocalRef(env,c);
-        }else{(*env)->ExceptionClear(env);jvmti_log("RecipeModifier: FindClass failed (may not be loaded yet)");}
-    }
+    /* 1c. RecipeModifier retransform: REMOVED along with the overclocking patch. */
 }
 
 /* ========== JNI ========== */
